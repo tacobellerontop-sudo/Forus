@@ -24,10 +24,11 @@ top of native Windows APIs: no runtime, no Electron, a single ~450 KB `.exe`.
 
 | Photos | Videos |
 | --- | --- |
-| JPEG, PNG, GIF (first frame), BMP, TIFF, ICO, WebP, JPEG XR, DDS | MP4, MOV, M4V, MKV, AVI, WMV, WebM, MPEG-TS, 3GP |
+| JPEG, PNG, animated GIF, BMP, TIFF, ICO, WebP, JPEG XR, DDS | MP4, MOV, M4V, MKV, AVI, WMV, WebM, MPEG-TS, 3GP |
 | HEIC/HEIF, AVIF, JPEG XL, camera RAW: need the matching codec from the Microsoft Store | HEVC, VP9 and AV1 need their video extension from the Microsoft Store |
 
-EXIF orientation is applied automatically. Transparent images are drawn over a
+Animated GIFs play with their own frame timing, offsets and disposal modes,
+matching how browsers show them. EXIF orientation is applied automatically. Transparent images are drawn over a
 checkerboard.
 
 ## Using it
@@ -47,7 +48,8 @@ in that folder.
 | 1 | Actual size (100%) |
 | R / Shift+R | Rotate clockwise / counter-clockwise |
 | F11, Enter, double-click | Full screen |
-| Space | Play / pause (next photo when viewing photos) |
+| Space | Play / pause videos and GIFs (next photo otherwise) |
+| , / . | Step to the previous / next GIF frame |
 | Shift+← → (Ctrl+Shift for 30 s) | Seek 5 s |
 | ↑ ↓ while a video plays | Volume |
 | M / L | Mute / toggle looping |

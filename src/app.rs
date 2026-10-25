@@ -148,6 +148,7 @@ fn message_loop() -> Result<()> {
         // Render if needed, then decide how long we may sleep.
         let wait = with_app(|app| {
             let now = Instant::now();
+            app.advance_animation(now);
             if app.dirty || app.animating(now) {
                 app.render();
             }
@@ -219,13 +220,61 @@ fn apply_window_style(hwnd: HWND) {
 // ---------------------------------------------------------------------------
 
 struct Picture {
-    bitmap: ID2D1Bitmap1,
+    /// One bitmap per frame (a single entry for still images) and how long
+    /// each frame stays on screen.
+    frames: Vec<(ID2D1Bitmap1, Duration)>,
+    frame: usize,
+    /// When to show the next frame; `None` for still or paused images.
+    next_frame_at: Option<Instant>,
     /// Bitmap size in pixels (may be smaller than the file if downscaled).
     pixels: (u32, u32),
     /// Size of the image in the file; zoom percentages refer to this.
     size: (u32, u32),
     orientation: u16,
     has_alpha: bool,
+}
+
+impl Picture {
+    fn bitmap(&self) -> &ID2D1Bitmap1 {
+        &self.frames[self.frame].0
+    }
+
+    fn is_animated(&self) -> bool {
+        self.frames.len() > 1
+    }
+
+    fn toggle_pause(&mut self) -> bool {
+        self.next_frame_at = match self.next_frame_at {
+            Some(_) => None,
+            None => Some(Instant::now() + self.frames[self.frame].1),
+        };
+        self.next_frame_at.is_none()
+    }
+
+    /// Pauses and moves `delta` frames.
+    fn step(&mut self, delta: isize) {
+        let n = self.frames.len() as isize;
+        self.next_frame_at = None;
+        self.frame = (self.frame as isize + delta).rem_euclid(n) as usize;
+    }
+
+    /// Advances to the frame due at `now`. Returns whether it changed.
+    fn advance(&mut self, now: Instant) -> bool {
+        let Some(mut due) = self.next_frame_at else { return false };
+        if now < due {
+            return false;
+        }
+        while now >= due {
+            self.frame = (self.frame + 1) % self.frames.len();
+            due += self.frames[self.frame].1;
+            // After a long stall (window hidden, modal loop) don't fast-forward.
+            if now.duration_since(due) > Duration::from_secs(1) {
+                due = now + self.frames[self.frame].1;
+            }
+        }
+        self.next_frame_at = Some(due);
+        true
+    }
 }
 
 enum Content {
@@ -478,9 +527,15 @@ impl App {
     }
 
     fn present_image(&mut self, img: &DecodedImage) {
-        self.content = match self.gfx.create_bitmap(img.width, img.height, &img.pixels) {
-            Ok(bitmap) => Content::Image(Picture {
-                bitmap,
+        let frames: Result<Vec<_>> = std::iter::once((&img.pixels, img.first_delay))
+            .chain(img.animation.iter().map(|f| (&f.pixels, f.delay)))
+            .map(|(px, delay)| Ok((self.gfx.create_bitmap(img.width, img.height, px)?, delay)))
+            .collect();
+        self.content = match frames {
+            Ok(frames) => Content::Image(Picture {
+                next_frame_at: (frames.len() > 1).then(|| Instant::now() + frames[0].1),
+                frames,
+                frame: 0,
                 pixels: (img.width, img.height),
                 size: img.source_size,
                 orientation: img.orientation,
@@ -681,12 +736,34 @@ impl App {
         playing || fading || toast || self.animate_until > now || self.waiting_for.is_some()
     }
 
-    /// When the next time-based change (UI fade-out) will happen.
+    /// When the next time-based change (UI fade-out, animation frame) will happen.
     fn next_wakeup(&self, now: Instant) -> Option<Duration> {
-        if self.ui_pinned() || self.ui_alpha(now) == 0.0 {
-            return None;
+        let fade = (!self.ui_pinned() && self.ui_alpha(now) > 0.0)
+            .then(|| (self.last_input + Duration::from_secs_f32(UI_HIDE_AFTER)).saturating_duration_since(now));
+        let frame = match &self.content {
+            Content::Image(p) => p.next_frame_at.map(|t| t.saturating_duration_since(now)),
+            _ => None,
+        };
+        match (fade, frame) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
         }
-        Some((self.last_input + Duration::from_secs_f32(UI_HIDE_AFTER)).saturating_duration_since(now))
+    }
+
+    /// Moves animated images on to the frame due now.
+    fn advance_animation(&mut self, now: Instant) {
+        if let Content::Image(p) = &mut self.content {
+            if p.advance(now) {
+                self.dirty = true;
+            }
+        }
+    }
+
+    fn picture_mut(&mut self) -> Option<&mut Picture> {
+        match &mut self.content {
+            Content::Image(p) if p.is_animated() => Some(p),
+            _ => None,
+        }
     }
 
     fn animate_for(&mut self, d: Duration) {
@@ -738,7 +815,7 @@ impl App {
     fn draw_content(&self) {
         let g = &self.gfx;
         let (bitmap, pixel_w, has_alpha) = match &self.content {
-            Content::Image(p) => (&p.bitmap, p.pixels.0 as f32, p.has_alpha),
+            Content::Image(p) => (p.bitmap(), p.pixels.0 as f32, p.has_alpha),
             Content::Video(v) => match v.bitmap() {
                 Some((b, size)) => (b, size.0 as f32, false),
                 None => return,
@@ -874,6 +951,11 @@ impl App {
             if let Some(p) = self.placement() {
                 parts.push(format!("{:.0}%", p.scale * 100.0));
             }
+            if let Content::Image(p) = &self.content {
+                if p.is_animated() {
+                    parts.push(format!("frame {} / {}", p.frame + 1, p.frames.len()));
+                }
+            }
             let text = parts.join("   ·   ");
             if let Ok((layout, tw, th)) = g.layout(&text, &self.fonts.body, w - 64.0 * s) {
                 let (x, y) = (16.0 * s, 16.0 * s);
@@ -980,7 +1062,8 @@ impl App {
             ("Drag", "Pan"),
             ("R / Shift+R", "Rotate"),
             ("F11, Enter, double-click", "Full screen"),
-            ("Space", "Play / pause (video)"),
+            ("Space", "Play / pause (video, GIF)"),
+            (", / .", "Previous / next GIF frame"),
             ("Shift+← →", "Seek 5 s (Ctrl+Shift: 30 s)"),
             ("↑ ↓ (video)", "Volume"),
             ("M / L", "Mute / loop"),
@@ -1113,8 +1196,21 @@ impl App {
                     v.toggle_play();
                     self.animate_for(Duration::from_millis(300));
                 }
-                None => self.go(1),
+                None => match self.picture_mut() {
+                    Some(p) => {
+                        let paused = p.toggle_pause();
+                        self.toast(if paused { "Paused" } else { "Playing" });
+                    }
+                    None => self.go(1),
+                },
             },
+            VK_OEM_COMMA | VK_OEM_PERIOD => {
+                if let Some(p) = self.picture_mut() {
+                    p.step(if vk == VK_OEM_COMMA { -1 } else { 1 });
+                    let text = format!("Frame {} / {}", p.frame + 1, p.frames.len());
+                    self.toast(&text);
+                }
+            }
             VK_UP if is_video => self.set_volume(0.05),
             VK_DOWN if is_video => self.set_volume(-0.05),
             VK_UP | VK_OEM_PLUS | VK_ADD => self.zoom_center(1.25),
@@ -1181,6 +1277,7 @@ impl App {
                 None
             }
             WM_TIMER if wparam.0 == TIMER_SIZEMOVE => {
+                self.advance_animation(Instant::now());
                 if self.dirty || self.animating(Instant::now()) {
                     self.render();
                 }
