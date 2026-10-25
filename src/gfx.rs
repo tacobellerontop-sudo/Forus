@@ -20,6 +20,9 @@ pub struct Fonts {
     pub body: IDWriteTextFormat,
     pub title: IDWriteTextFormat,
     pub icons: IDWriteTextFormat,
+    /// Title bar text and caption-button glyphs (Windows 11 sizes).
+    pub caption_text: IDWriteTextFormat,
+    pub caption_buttons: IDWriteTextFormat,
 }
 
 pub struct Gfx {
@@ -208,10 +211,51 @@ impl Gfx {
                 body: make(&ui, 13.0, DWRITE_FONT_WEIGHT_NORMAL)?,
                 title: make(&ui, 15.0, DWRITE_FONT_WEIGHT_SEMI_BOLD)?,
                 icons: make(&icons, 16.0, DWRITE_FONT_WEIGHT_NORMAL)?,
+                caption_text: make(&ui, 12.0, DWRITE_FONT_WEIGHT_NORMAL)?,
+                caption_buttons: make(&icons, 10.0, DWRITE_FONT_WEIGHT_NORMAL)?,
             };
-            fonts.icons.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)?;
-            fonts.icons.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
+            for f in [&fonts.icons, &fonts.caption_buttons] {
+                f.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)?;
+                f.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
+            }
             Ok(fonts)
+        }
+    }
+
+    /// The app icon embedded in the exe (resource 1) at `size` pixels.
+    pub fn app_icon(&self, size: u32) -> Result<ID2D1Bitmap1> {
+        use windows::core::PCWSTR;
+        use windows::Win32::Graphics::Imaging::*;
+        use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
+        use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+        use windows::Win32::UI::WindowsAndMessaging::*;
+        unsafe {
+            let instance = GetModuleHandleW(None)?;
+            let handle = LoadImageW(
+                Some(instance.into()),
+                PCWSTR(1 as _),
+                IMAGE_ICON,
+                size as i32,
+                size as i32,
+                LR_DEFAULTCOLOR,
+            )?;
+            let icon = HICON(handle.0);
+            let wic: IWICImagingFactory = CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER)?;
+            let result = (|| {
+                let bmp = wic.CreateBitmapFromHICON(icon)?;
+                let conv = wic.CreateFormatConverter()?;
+                conv.Initialize(
+                    &bmp,
+                    &GUID_WICPixelFormat32bppPBGRA,
+                    WICBitmapDitherTypeNone,
+                    None,
+                    0.0,
+                    WICBitmapPaletteTypeMedianCut,
+                )?;
+                self.ctx.CreateBitmapFromWicBitmap(&conv, None)
+            })();
+            let _ = DestroyIcon(icon);
+            result
         }
     }
 

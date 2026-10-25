@@ -29,6 +29,7 @@ use crate::assoc;
 use crate::decode::{DecodedImage, Decoder};
 use crate::files::{self, Kind};
 use crate::gfx::{color, rect, Fonts, Gfx};
+use crate::titlebar::{self, Button, TitleBar, TitleHit, TitleState, Tool};
 use crate::video::{self, Video};
 use crate::{WM_APP_DECODED, WM_APP_MEDIA};
 
@@ -140,7 +141,7 @@ pub fn run() -> Result<()> {
             work.top + (work.bottom - work.top - h) / 2,
             w,
             h,
-            SWP_NOZORDER | SWP_NOACTIVATE,
+            SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
         );
 
         let mut app = App::new(hwnd)?;
@@ -204,6 +205,23 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             return LRESULT(0);
         }
         WM_ERASEBKGND => return LRESULT(1),
+        WM_NCCALCSIZE if wparam.0 != 0 => {
+            // Remove the native caption but keep the native left/right/bottom
+            // resize borders, shadow and rounded corners: let Windows compute
+            // the client area, then give the caption strip back to it.
+            unsafe {
+                let params = &mut *(lparam.0 as *mut NCCALCSIZE_PARAMS);
+                let top = params.rgrc[0].top;
+                let result = DefWindowProcW(hwnd, msg, wparam, lparam);
+                params.rgrc[0].top = top;
+                // A maximized window hangs its frame off-screen; keep the
+                // title bar on the monitor.
+                if IsZoomed(hwnd).as_bool() {
+                    params.rgrc[0].top += frame_thickness(hwnd);
+                }
+                return result;
+            }
+        }
         WM_GETMINMAXINFO => {
             let info = unsafe { &mut *(lparam.0 as *mut MINMAXINFO) };
             let scale = unsafe { GetDpiForWindow(hwnd) } as f32 / 96.0;
@@ -216,6 +234,14 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
         return result;
     }
     unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+}
+
+/// Height of the (invisible) top resize border, in pixels.
+fn frame_thickness(hwnd: HWND) -> i32 {
+    unsafe {
+        let dpi = GetDpiForWindow(hwnd);
+        GetSystemMetricsForDpi(SM_CYFRAME, dpi) + GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi)
+    }
 }
 
 fn apply_window_style(hwnd: HWND) {
@@ -387,6 +413,12 @@ struct App {
     epoch: Instant,
     cursor_hidden: bool,
     tracking_leave: bool,
+    tracking_nc_leave: bool,
+    // Title bar state.
+    title_hover: Option<TitleHit>,
+    title_pressed: Option<TitleHit>,
+    active: bool,
+    app_icon: Option<ID2D1Bitmap1>,
 }
 
 fn is_device_lost(e: &Error) -> bool {
@@ -400,6 +432,7 @@ impl App {
         let ui_scale = unsafe { GetDpiForWindow(hwnd) } as f32 / 96.0;
         let fonts = gfx.fonts(ui_scale)?;
         let decoder = Decoder::new(hwnd, gfx.max_bitmap_size.min(16384));
+        let app_icon = gfx.app_icon((16.0 * ui_scale).round() as u32).ok();
         let now = Instant::now();
         Ok(Self {
             hwnd,
@@ -430,7 +463,140 @@ impl App {
             epoch: now,
             cursor_hidden: false,
             tracking_leave: false,
+            tracking_nc_leave: false,
+            title_hover: None,
+            title_pressed: None,
+            active: true,
+            app_icon,
         })
+    }
+
+    // ---- title bar --------------------------------------------------------
+
+    /// Height of the title bar; none in full screen.
+    fn top(&self) -> f32 {
+        if self.fullscreen.is_some() {
+            0.0
+        } else {
+            self.title_bar().height
+        }
+    }
+
+    fn title_bar(&self) -> TitleBar {
+        TitleBar::layout(self.gfx.size().0 as f32, self.ui_scale)
+    }
+
+    fn title_hit(&self, x: f32, y: f32) -> Option<TitleHit> {
+        if self.fullscreen.is_some() {
+            return None;
+        }
+        self.title_bar().hit(x, y)
+    }
+
+    fn tool_enabled(&self, tool: Tool) -> bool {
+        match tool {
+            Tool::Previous | Tool::Next => self.files.len() > 1,
+            Tool::Rotate | Tool::Fit => self.content_geometry().is_some(),
+            _ => true,
+        }
+    }
+
+    fn run_tool(&mut self, tool: Tool) {
+        if !self.tool_enabled(tool) {
+            return;
+        }
+        match tool {
+            Tool::Open => self.open_dialog(),
+            Tool::Previous => self.go(-1),
+            Tool::Next => self.go(1),
+            Tool::Rotate => self.rotate(true),
+            Tool::Fit => self.fit(),
+            Tool::FullScreen => self.toggle_fullscreen(),
+            Tool::Help => self.show_help = !self.show_help,
+        }
+        self.dirty = true;
+    }
+
+    fn press_caption_button(&mut self, button: Button) {
+        unsafe {
+            match button {
+                Button::Minimize => {
+                    let _ = ShowWindow(self.hwnd, SW_MINIMIZE);
+                }
+                Button::Maximize => {
+                    let maximized = IsZoomed(self.hwnd).as_bool();
+                    let _ = ShowWindow(self.hwnd, if maximized { SW_RESTORE } else { SW_MAXIMIZE });
+                }
+                Button::Close => {
+                    let _ = PostMessageW(Some(self.hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
+                }
+            }
+        }
+    }
+
+    fn draw_title_bar(&self) {
+        if self.fullscreen.is_some() {
+            return;
+        }
+        let title = match self.current_path().and_then(|p| p.file_name()) {
+            Some(name) if self.files.len() > 1 => {
+                format!("{}  ·  {} / {}", name.to_string_lossy(), self.index + 1, self.files.len())
+            }
+            Some(name) => name.to_string_lossy().into_owned(),
+            None => APP_NAME.to_string(),
+        };
+        let enabled = |t: Tool| self.tool_enabled(t);
+        let state = TitleState {
+            title: &title,
+            icon: self.app_icon.as_ref(),
+            active: self.active,
+            maximized: unsafe { IsZoomed(self.hwnd) }.as_bool(),
+            hover: self.title_hover,
+            pressed: self.title_pressed,
+            enabled: &enabled,
+        };
+        titlebar::draw(&self.gfx, &self.fonts, &self.title_bar(), self.gfx.size().0 as f32, &state);
+    }
+
+    /// WM_NCHITTEST: native borders, our caption, Windows' caption buttons.
+    fn nc_hit_test(&self, lparam: LPARAM) -> LRESULT {
+        let native = unsafe { DefWindowProcW(self.hwnd, WM_NCHITTEST, WPARAM(0), lparam) };
+        if native.0 as u32 != HTCLIENT || self.fullscreen.is_some() {
+            return native;
+        }
+        let mut p = POINT { x: get_x(lparam), y: get_y(lparam) };
+        unsafe {
+            let _ = ScreenToClient(self.hwnd, &mut p);
+        }
+        let (x, y) = (p.x as f32, p.y as f32);
+        let maximized = unsafe { IsZoomed(self.hwnd) }.as_bool();
+        let frame = frame_thickness(self.hwnd);
+        if !maximized && p.y < frame {
+            let w = self.gfx.size().0 as i32;
+            return LRESULT(if p.x < frame * 2 {
+                HTTOPLEFT
+            } else if p.x >= w - frame * 2 {
+                HTTOPRIGHT
+            } else {
+                HTTOP
+            } as isize);
+        }
+        LRESULT(match self.title_hit(x, y) {
+            Some(TitleHit::Caption) => HTCAPTION,
+            Some(TitleHit::Button(Button::Minimize)) => HTMINBUTTON,
+            Some(TitleHit::Button(Button::Maximize)) => HTMAXBUTTON,
+            Some(TitleHit::Button(Button::Close)) => HTCLOSE,
+            Some(TitleHit::Tool(_)) | None => HTCLIENT,
+        } as isize)
+    }
+
+    fn caption_button_for(code: usize) -> Option<Button> {
+        match code as u32 {
+            HTMINBUTTON => Some(Button::Minimize),
+            HTMAXBUTTON => Some(Button::Maximize),
+            HTCLOSE => Some(Button::Close),
+            _ => None,
+        }
     }
 
     // ---- navigation -------------------------------------------------------
@@ -649,9 +815,16 @@ impl App {
         Some((w as f32, h as f32, (q + self.view.rotation) % 4, flip, upscale))
     }
 
+    /// Size of the content area (the client area below the title bar).
     fn window_size(&self) -> (f32, f32) {
         let (w, h) = self.gfx.size();
-        (w as f32, h as f32)
+        (w as f32, (h as f32 - self.top()).max(1.0))
+    }
+
+    /// Center of the content area in client coordinates.
+    fn view_center(&self) -> (f32, f32) {
+        let (w, h) = self.window_size();
+        (w / 2.0, self.top() + h / 2.0)
     }
 
     fn placement(&self) -> Option<Placement> {
@@ -664,7 +837,8 @@ impl App {
         }
         let scale = self.view.zoom.unwrap_or(fit);
         let (px, py) = self.clamp_pan(self.view.pan, scale, dw, dh);
-        Some(Placement { scale, fit, cx: ww / 2.0 + px, cy: wh / 2.0 + py, dw, dh })
+        let (vx, vy) = self.view_center();
+        Some(Placement { scale, fit, cx: vx + px, cy: vy + py, dw, dh })
     }
 
     fn clamp_pan(&self, pan: (f32, f32), scale: f32, dw: f32, dh: f32) -> (f32, f32) {
@@ -693,9 +867,9 @@ impl App {
             new = p.fit;
         }
         let f = new / p.scale;
-        let (ww, wh) = self.window_size();
-        let (ox, oy) = (x - ww / 2.0, y - wh / 2.0);
-        let pan = (ox - (ox - (p.cx - ww / 2.0)) * f, oy - (oy - (p.cy - wh / 2.0)) * f);
+        let (vx, vy) = self.view_center();
+        let (ox, oy) = (x - vx, y - vy);
+        let pan = (ox - (ox - (p.cx - vx)) * f, oy - (oy - (p.cy - vy)) * f);
         self.view.zoom = if (new - p.fit).abs() < 1e-4 { None } else { Some(new) };
         self.view.pan = self.clamp_pan(pan, new, p.dw, p.dh);
         self.toast(&format!("{:.0}%", new * 100.0));
@@ -703,8 +877,8 @@ impl App {
     }
 
     fn zoom_center(&mut self, factor: f32) {
-        let (w, h) = self.window_size();
-        self.zoom_at(factor, w / 2.0, h / 2.0);
+        let (x, y) = self.view_center();
+        self.zoom_at(factor, x, y);
     }
 
     fn set_actual_size(&mut self) {
@@ -832,6 +1006,7 @@ impl App {
         self.content = Content::Empty;
         match Gfx::new(self.hwnd).and_then(|g| g.fonts(self.ui_scale).map(|f| (g, f))) {
             Ok((gfx, fonts)) => {
+                self.app_icon = gfx.app_icon((16.0 * self.ui_scale).round() as u32).ok();
                 self.gfx = gfx;
                 self.fonts = fonts;
                 self.show_current();
@@ -852,6 +1027,7 @@ impl App {
         }
         self.draw_content();
         self.draw_chrome(now);
+        self.draw_title_bar();
         unsafe { self.gfx.ctx.EndDraw(None, None)? };
         self.gfx.present()
     }
@@ -894,6 +1070,7 @@ impl App {
         self.video()?;
         let s = self.ui_scale;
         let (w, h) = self.window_size();
+        let h = h + self.top();
         let width = (w - 32.0 * s).min(860.0 * s);
         let left = (w - width) / 2.0;
         let panel = rect(left, h - 16.0 * s - 52.0 * s, left + width, h - 16.0 * s);
@@ -938,6 +1115,7 @@ impl App {
         let g = &self.gfx;
         let s = self.ui_scale;
         let (w, h) = self.window_size();
+        let top = self.top();
         let alpha = self.ui_alpha(now);
         let white = |a: f32| color(1.0, 1.0, 1.0, a);
         let panel_bg = |a: f32| color(0.11, 0.11, 0.12, 0.82 * a);
@@ -949,7 +1127,7 @@ impl App {
                     ("Drop a file here, or press Ctrl+O  ·  F1 for shortcuts", &self.fonts.body, 0.6),
                     ("Press D to make Forus your default photo and video viewer", &self.fonts.body, 0.45),
                 ];
-                let mut y = h / 2.0 - 24.0 * s;
+                let mut y = top + h / 2.0 - 24.0 * s;
                 for (text, font, a) in lines {
                     if let Ok((layout, tw, th)) = g.layout(text, font, w) {
                         g.draw_layout(&layout, (w - tw) / 2.0, y, white(a));
@@ -960,7 +1138,7 @@ impl App {
             Content::Error(msg) => {
                 let name = self.current_path().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned());
                 let max = (w - 64.0 * s).min(560.0 * s);
-                let mut y = h / 2.0 - 30.0 * s;
+                let mut y = top + h / 2.0 - 30.0 * s;
                 for (text, font, a) in [
                     (name.unwrap_or_default(), &self.fonts.title, 0.95),
                     (msg.clone(), &self.fonts.body, 0.65),
@@ -977,17 +1155,20 @@ impl App {
         let loading = self.waiting_for.is_some()
             || self.video().is_some_and(|v| v.bitmap().is_none());
         if loading {
-            self.draw_spinner(w / 2.0, h / 2.0, now);
+            self.draw_spinner(w / 2.0, top + h / 2.0, now);
         }
 
         // Info pill (top left).
         if alpha > 0.0 && !self.files.is_empty() {
             let mut parts = Vec::new();
-            if let Some(name) = self.current_path().and_then(|p| p.file_name()) {
-                parts.push(name.to_string_lossy().into_owned());
-            }
-            if self.files.len() > 1 {
-                parts.push(format!("{} / {}", self.index + 1, self.files.len()));
+            // The title bar shows name and position; full screen has none.
+            if top == 0.0 {
+                if let Some(name) = self.current_path().and_then(|p| p.file_name()) {
+                    parts.push(name.to_string_lossy().into_owned());
+                }
+                if self.files.len() > 1 {
+                    parts.push(format!("{} / {}", self.index + 1, self.files.len()));
+                }
             }
             if let Some((cw, ch, q, ..)) = self.content_geometry() {
                 let (cw, ch) = if q % 2 == 1 { (ch, cw) } else { (cw, ch) };
@@ -1003,7 +1184,7 @@ impl App {
             }
             let text = parts.join("   ·   ");
             if let Ok((layout, tw, th)) = g.layout(&text, &self.fonts.body, w - 64.0 * s) {
-                let (x, y) = (16.0 * s, 16.0 * s);
+                let (x, y) = (16.0 * s, top + 16.0 * s);
                 let pad = (12.0 * s, 7.0 * s);
                 g.fill_round(rect(x, y, x + tw + pad.0 * 2.0, y + th + pad.1 * 2.0), 8.0 * s, panel_bg(alpha));
                 g.draw_layout(&layout, x + pad.0, y + pad.1, white(0.92 * alpha));
@@ -1023,7 +1204,7 @@ impl App {
                 if let Ok((layout, tw, th)) = g.layout(text, &self.fonts.title, w) {
                     let pad = (16.0 * s, 9.0 * s);
                     let x = (w - tw) / 2.0 - pad.0;
-                    let y = 16.0 * s;
+                    let y = top + 16.0 * s;
                     g.fill_round(rect(x, y, x + tw + pad.0 * 2.0, y + th + pad.1 * 2.0), 10.0 * s, panel_bg(a));
                     g.draw_layout(&layout, x + pad.0, y + pad.1, white(a));
                 }
@@ -1124,9 +1305,10 @@ impl App {
         let key_w = 220.0 * s;
         let panel_w = (480.0 * s).min(w - 32.0 * s);
         let panel_h = row_h * KEYS.len() as f32 + 76.0 * s;
+        let top = self.top();
         let x = (w - panel_w) / 2.0;
-        let y = ((h - panel_h) / 2.0).max(16.0 * s);
-        g.fill_rect(rect(0.0, 0.0, w, h), color(0.0, 0.0, 0.0, 0.45));
+        let y = top + ((h - panel_h) / 2.0).max(16.0 * s);
+        g.fill_rect(rect(0.0, top, w, top + h), color(0.0, 0.0, 0.0, 0.45));
         g.fill_round(rect(x, y, x + panel_w, y + panel_h), 14.0 * s, color(0.13, 0.13, 0.14, 0.97));
         g.draw_text(
             "Keyboard shortcuts",
@@ -1312,6 +1494,61 @@ impl App {
                 }
                 Some(LRESULT(0))
             }
+            WM_NCHITTEST => Some(self.nc_hit_test(lparam)),
+            WM_ACTIVATE => {
+                self.active = (wparam.0 & 0xffff) as u32 != WA_INACTIVE;
+                self.dirty = true;
+                None
+            }
+            WM_NCMOUSEMOVE => {
+                let hover = Self::caption_button_for(wparam.0).map(TitleHit::Button);
+                if hover != self.title_hover {
+                    self.title_hover = hover;
+                    self.dirty = true;
+                }
+                if !self.tracking_nc_leave {
+                    let mut tme = TRACKMOUSEEVENT {
+                        cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                        dwFlags: TME_LEAVE | TME_NONCLIENT,
+                        hwndTrack: self.hwnd,
+                        dwHoverTime: 0,
+                    };
+                    self.tracking_nc_leave = unsafe { TrackMouseEvent(&mut tme) }.is_ok();
+                }
+                None
+            }
+            WM_NCMOUSELEAVE => {
+                self.tracking_nc_leave = false;
+                if matches!(self.title_hover, Some(TitleHit::Button(_))) || self.title_pressed.is_some() {
+                    self.title_hover = None;
+                    self.title_pressed = None;
+                    self.dirty = true;
+                }
+                None
+            }
+            // Caption buttons are ours to draw; stop Windows drawing classic
+            // ones, and act on release like native buttons do.
+            WM_NCLBUTTONDOWN | WM_NCLBUTTONDBLCLK => {
+                let button = Self::caption_button_for(wparam.0)?;
+                self.title_pressed = Some(TitleHit::Button(button));
+                self.dirty = true;
+                Some(LRESULT(0))
+            }
+            WM_NCLBUTTONUP => {
+                let button = Self::caption_button_for(wparam.0);
+                let pressed = self.title_pressed.take();
+                self.dirty = true;
+                match button {
+                    Some(b) => {
+                        if pressed == Some(TitleHit::Button(b)) {
+                            self.title_hover = None;
+                            self.press_caption_button(b);
+                        }
+                        Some(LRESULT(0))
+                    }
+                    None => None,
+                }
+            }
             WM_ENTERSIZEMOVE => {
                 // Keep video running while Windows runs its modal move loop.
                 unsafe { SetTimer(Some(self.hwnd), TIMER_SIZEMOVE, 15, None) };
@@ -1335,6 +1572,7 @@ impl App {
                 if let Ok(f) = self.gfx.fonts(self.ui_scale) {
                     self.fonts = f;
                 }
+                self.app_icon = self.gfx.app_icon((16.0 * self.ui_scale).round() as u32).ok();
                 let r = unsafe { &*(lparam.0 as *const RECT) };
                 unsafe {
                     let _ = SetWindowPos(
@@ -1376,11 +1614,16 @@ impl App {
             WM_LBUTTONDOWN => {
                 let (x, y) = pt();
                 self.poke();
+                unsafe { SetCapture(self.hwnd) };
+                if let Some(hit @ TitleHit::Tool(_)) = self.title_hit(x, y) {
+                    self.title_pressed = Some(hit);
+                    self.dirty = true;
+                    return Some(LRESULT(0));
+                }
                 if self.show_help {
                     self.show_help = false;
                     return Some(LRESULT(0));
                 }
-                unsafe { SetCapture(self.hwnd) };
                 match self.hit_test(x, y) {
                     Hit::Play => {
                         if let Some(v) = self.video() {
@@ -1396,7 +1639,10 @@ impl App {
             }
             WM_LBUTTONDBLCLK => {
                 let (x, y) = pt();
-                if self.hit_test(x, y) == Hit::None {
+                if let Some(TitleHit::Tool(tool)) = self.title_hit(x, y) {
+                    // A fast second click on a tool is just another click.
+                    self.run_tool(tool);
+                } else if self.hit_test(x, y) == Hit::None && y >= self.top() {
                     self.toggle_fullscreen();
                 }
                 Some(LRESULT(0))
@@ -1425,6 +1671,11 @@ impl App {
                         self.dirty = true;
                     }
                 }
+                let title_hover = self.title_hit(x, y).filter(|h| matches!(h, TitleHit::Tool(_)));
+                if title_hover != self.title_hover {
+                    self.title_hover = title_hover;
+                    self.dirty = true;
+                }
                 let hover = self.hit_test(x, y);
                 if hover != self.hover || was_hidden {
                     self.hover = hover;
@@ -1434,13 +1685,25 @@ impl App {
             }
             WM_MOUSELEAVE => {
                 self.tracking_leave = false;
-                if self.hover != Hit::None {
+                if self.hover != Hit::None || matches!(self.title_hover, Some(TitleHit::Tool(_))) {
                     self.hover = Hit::None;
+                    self.title_hover = None;
                     self.dirty = true;
                 }
                 Some(LRESULT(0))
             }
             WM_LBUTTONUP => {
+                if let Some(TitleHit::Tool(tool)) = self.title_pressed.take() {
+                    let (x, y) = pt();
+                    unsafe {
+                        let _ = ReleaseCapture();
+                    }
+                    if self.title_hit(x, y) == Some(TitleHit::Tool(tool)) {
+                        self.run_tool(tool);
+                    }
+                    self.dirty = true;
+                    return Some(LRESULT(0));
+                }
                 self.drag = None;
                 if let (Some(t), Some(v)) = (self.scrub.take(), self.video()) {
                     v.seek(t); // land precisely where the scrub ended
@@ -1459,6 +1722,8 @@ impl App {
             WM_SETCURSOR if (lparam.0 & 0xffff) as u32 == HTCLIENT => {
                 let cursor = if self.fullscreen.is_some() && self.ui_alpha(Instant::now()) == 0.0 {
                     None
+                } else if self.title_hover.is_some() {
+                    Some(IDC_ARROW)
                 } else if self.hover != Hit::None {
                     Some(IDC_HAND)
                 } else if self.view.zoom.is_some() && self.content_geometry().is_some() {
@@ -1521,8 +1786,8 @@ impl App {
     fn placement_pan(&self) -> (f32, f32) {
         match self.placement() {
             Some(p) => {
-                let (w, h) = self.window_size();
-                (p.cx - w / 2.0, p.cy - h / 2.0)
+                let (vx, vy) = self.view_center();
+                (p.cx - vx, p.cy - vy)
             }
             None => (0.0, 0.0),
         }

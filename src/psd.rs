@@ -149,7 +149,7 @@ pub fn decode(data: &[u8]) -> Result<RgbaImage, String> {
     let alpha = (composite_has_alpha && channels > colour_channels).then_some(colour_channels);
 
     let mut out = vec![0u8; width * height * 4];
-    for (i, px) in out.chunks_exact_mut(4).enumerate() {
+    for (i, px) in out.as_chunks_mut::<4>().0.iter_mut().enumerate() {
         let rgb = match mode {
             3 => [sample(0, i), sample(1, i), sample(2, i)],
             4 => {

@@ -27,7 +27,7 @@ use crate::{fallback, WM_APP_DECODED};
 pub const MAX_PIXELS: u64 = 120_000_000;
 
 /// Memory budget for all composited frames of an animation.
-const MAX_ANIMATION_BYTES: usize = 768 * 1024 * 1024;
+pub const MAX_ANIMATION_BYTES: usize = 768 * 1024 * 1024;
 
 /// Browsers treat GIF delays this short as "unspecified" and use 100 ms.
 const MIN_FRAME_DELAY: Duration = Duration::from_millis(20);
@@ -145,6 +145,15 @@ fn decode_any(
     if fallback::preferred(&ext) {
         return fallback_guarded(path, &ext, max_dimension);
     }
+    // WIC only shows the first frame of animated WebP/PNG.
+    if matches!(ext.as_str(), "webp" | "png" | "apng") {
+        let animated = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::extra::animated(path, &ext, max_dimension)
+        }));
+        if let Ok(Some(Ok(img))) = animated {
+            return Ok(img);
+        }
+    }
     let wic_error = match factory.map(|f| decode(f, path, max_dimension)) {
         Some(Ok(img)) => return Ok(img),
         Some(Err(e)) => describe(e),
@@ -239,7 +248,7 @@ fn decode(
         let stride = w * 4;
         let mut pixels = vec![0u8; stride as usize * h as usize];
         source.CopyPixels(std::ptr::null(), stride, &mut pixels)?;
-        let has_alpha = pixels.chunks_exact(4).any(|p| p[3] != 255);
+        let has_alpha = pixels.as_chunks::<4>().0.iter().any(|p| p[3] != 255);
 
         Ok(DecodedImage {
             width: w,
@@ -332,7 +341,7 @@ fn decode_gif(
             for y in 0..ch {
                 let src = &sub[y * fstride..y * fstride + cw * 4];
                 let dst = &mut canvas[(top + y) * stride + left * 4..][..cw * 4];
-                for (d, s) in dst.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
+                for (d, s) in dst.as_chunks_mut::<4>().0.iter_mut().zip(src.as_chunks::<4>().0) {
                     if s[3] != 0 {
                         d.copy_from_slice(s);
                     }
@@ -355,7 +364,7 @@ fn decode_gif(
             return Err(fail());
         }
 
-        let has_alpha = frames.iter().any(|f| f.pixels.chunks_exact(4).any(|p| p[3] != 255));
+        let has_alpha = frames.iter().any(|f| f.pixels.as_chunks::<4>().0.iter().any(|p| p[3] != 255));
         let mut frames = frames.into_iter();
         let first = frames.next().unwrap();
         Ok(DecodedImage {

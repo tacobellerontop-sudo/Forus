@@ -19,13 +19,9 @@ const KNOWN_IMAGE_EXTENSIONS: &[&str] = &[
     "tiff", "ico", "cur", "jxr", "wdp", "hdp", "dds", "webp",
     // Fallback decoders bundled with Forus
     "svg", "svgz", "psd", "psb", "tga", "icb", "vda", "vst", "qoi", "pbm", "pgm", "ppm", "pnm", "pam",
-    "hdr", "pic", "exr", "ff", "jxl",
+    "hdr", "pic", "exr", "ff", "jxl", "pcx", "icns", "kra", "ora", "procreate", "sketch",
     // Need a codec extension from the Microsoft Store
     "heic", "heif", "hif", "avif", "avifs",
-    // Camera RAW (Raw Image Extension)
-    "dng", "cr2", "cr3", "crw", "nef", "nrw", "arw", "srf", "sr2", "orf", "rw2", "raf", "pef",
-    "ptx", "srw", "x3f", "erf", "kdc", "dcr", "mrw", "mos", "mef", "3fr", "fff", "iiq", "rwl",
-    "raw",
 ];
 
 static IMAGE_EXTENSIONS: OnceLock<Vec<String>> = OnceLock::new();
@@ -34,7 +30,11 @@ static IMAGE_EXTENSIONS: OnceLock<Vec<String>> = OnceLock::new();
 /// are installed on this PC (third-party WIC codecs included). Sorted.
 pub fn image_extensions() -> &'static [String] {
     IMAGE_EXTENSIONS.get_or_init(|| {
-        let mut all: BTreeSet<String> = KNOWN_IMAGE_EXTENSIONS.iter().map(|e| e.to_string()).collect();
+        let mut all: BTreeSet<String> = KNOWN_IMAGE_EXTENSIONS
+            .iter()
+            .chain(crate::fallback::RAW_EXTENSIONS)
+            .map(|e| e.to_string())
+            .collect();
         all.extend(installed_wic_extensions());
         all.retain(|e| !VIDEO_EXTENSIONS.contains(&e.as_str()));
         all.into_iter().collect()

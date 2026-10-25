@@ -12,7 +12,8 @@ windows-numerics = "0.3"
 # Fallback decoders for formats Windows has no built-in codec for
 # (Photoshop files are read by our own src/psd.rs).
 resvg = "0.49"
-jxl-oxide = { version = "0.12", features = ["image"] }
+flate2 = "1"
+jxl-oxide ={ version = "0.12", features = ["image"] }
 
 [dependencies.image]
 version = "0.25"
