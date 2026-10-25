@@ -6,9 +6,12 @@
 compile_error!("Forus is a Windows application; build it for a Windows target.");
 
 mod app;
+mod assoc;
 mod decode;
+mod fallback;
 mod files;
 mod gfx;
+mod psd;
 mod video;
 
 use windows::Win32::UI::WindowsAndMessaging::WM_APP;

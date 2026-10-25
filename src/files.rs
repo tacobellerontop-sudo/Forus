@@ -1,17 +1,82 @@
 //! File type detection and folder navigation.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
-use windows::core::PCWSTR;
+use windows::core::{Interface, PCWSTR};
+use windows::Win32::Graphics::Imaging::*;
+use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
 use windows::Win32::UI::Shell::StrCmpLogicalW;
 
-/// Formats decoded by WIC. HEIC/WebP/AVIF/JXL rely on the codec extensions
-/// that ship with (or are installable from the Store on) Windows 11.
-pub const IMAGE_EXTENSIONS: &[&str] = &[
-    "jpg", "jpeg", "jpe", "jfif", "png", "bmp", "dib", "gif", "tif", "tiff", "ico", "webp",
-    "heic", "heif", "avif", "jxl", "jxr", "wdp", "dds", "dng", "cr2", "cr3", "nef", "arw",
-    "orf", "rw2",
+/// Image formats Forus always recognises: the ones Windows decodes out of the
+/// box, those our own fallback decoders handle (SVG, PSD, TGA, QOI, PNM,
+/// HDR/EXR, JPEG XL...), and common ones that need a Store codec (HEIC, AVIF,
+/// camera RAW) so the user gets a helpful message instead of nothing.
+const KNOWN_IMAGE_EXTENSIONS: &[&str] = &[
+    // Windows built-in codecs
+    "jpg", "jpeg", "jpe", "jfif", "exif", "png", "apng", "bmp", "dib", "rle", "gif", "tif",
+    "tiff", "ico", "cur", "jxr", "wdp", "hdp", "dds", "webp",
+    // Fallback decoders bundled with Forus
+    "svg", "svgz", "psd", "psb", "tga", "icb", "vda", "vst", "qoi", "pbm", "pgm", "ppm", "pnm", "pam",
+    "hdr", "pic", "exr", "ff", "jxl",
+    // Need a codec extension from the Microsoft Store
+    "heic", "heif", "hif", "avif", "avifs",
+    // Camera RAW (Raw Image Extension)
+    "dng", "cr2", "cr3", "crw", "nef", "nrw", "arw", "srf", "sr2", "orf", "rw2", "raf", "pef",
+    "ptx", "srw", "x3f", "erf", "kdc", "dcr", "mrw", "mos", "mef", "3fr", "fff", "iiq", "rwl",
+    "raw",
 ];
+
+static IMAGE_EXTENSIONS: OnceLock<Vec<String>> = OnceLock::new();
+
+/// Every image extension we can open: the known list plus whatever decoders
+/// are installed on this PC (third-party WIC codecs included). Sorted.
+pub fn image_extensions() -> &'static [String] {
+    IMAGE_EXTENSIONS.get_or_init(|| {
+        let mut all: BTreeSet<String> = KNOWN_IMAGE_EXTENSIONS.iter().map(|e| e.to_string()).collect();
+        all.extend(installed_wic_extensions());
+        all.retain(|e| !VIDEO_EXTENSIONS.contains(&e.as_str()));
+        all.into_iter().collect()
+    })
+}
+
+/// Asks WIC for every installed decoder's file extensions. Needs COM.
+fn installed_wic_extensions() -> Vec<String> {
+    let mut out = Vec::new();
+    unsafe {
+        let Ok(factory) =
+            CoCreateInstance::<_, IWICImagingFactory>(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER)
+        else {
+            return out;
+        };
+        let Ok(components) =
+            factory.CreateComponentEnumerator(WICDecoder.0 as u32, WICComponentEnumerateDefault.0 as u32)
+        else {
+            return out;
+        };
+        loop {
+            let mut item = [None];
+            let mut fetched = 0u32;
+            let _ = components.Next(&mut item, Some(&mut fetched));
+            let Some(unknown) = item[0].take().filter(|_| fetched == 1) else { break };
+            let Ok(info) = unknown.cast::<IWICBitmapCodecInfo>() else { continue };
+            let mut len = 0u32;
+            let _ = info.GetFileExtensions(&mut [], &mut len);
+            let mut buf = vec![0u16; len as usize];
+            if len == 0 || info.GetFileExtensions(&mut buf, &mut len).is_err() {
+                continue;
+            }
+            let list = String::from_utf16_lossy(&buf[..len.saturating_sub(1) as usize]);
+            out.extend(
+                list.split([',', ';'])
+                    .map(|e| e.trim().trim_start_matches('*').trim_start_matches('.').to_ascii_lowercase())
+                    .filter(|e| !e.is_empty() && e.chars().all(|c| c.is_ascii_alphanumeric())),
+            );
+        }
+    }
+    out
+}
 
 /// Containers played through the Media Foundation Media Engine.
 pub const VIDEO_EXTENSIONS: &[&str] = &[
@@ -32,7 +97,7 @@ fn extension(path: &Path) -> Option<String> {
 
 pub fn kind_of(path: &Path) -> Option<Kind> {
     let ext = extension(path)?;
-    if IMAGE_EXTENSIONS.contains(&ext.as_str()) {
+    if image_extensions().binary_search(&ext).is_ok() {
         Some(Kind::Image)
     } else if VIDEO_EXTENSIONS.contains(&ext.as_str()) {
         Some(Kind::Video)
@@ -99,9 +164,9 @@ fn same_path(a: &Path, b: &Path) -> bool {
 }
 
 /// File-dialog filter spec, e.g. "*.jpg;*.png;...".
-pub fn filter_spec(exts: &[&str]) -> String {
+pub fn filter_spec<S: AsRef<str>>(exts: &[S]) -> String {
     exts.iter()
-        .map(|e| format!("*.{e}"))
+        .map(|e| format!("*.{}", e.as_ref()))
         .collect::<Vec<_>>()
         .join(";")
 }

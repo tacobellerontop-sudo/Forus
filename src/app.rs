@@ -25,6 +25,7 @@ use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows_numerics::Matrix3x2;
 
+use crate::assoc;
 use crate::decode::{DecodedImage, Decoder};
 use crate::files::{self, Kind};
 use crate::gfx::{color, rect, Fonts, Gfx};
@@ -65,6 +66,31 @@ pub fn run() -> Result<()> {
         CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok()?;
         MFStartup(MF_VERSION, MFSTARTUP_FULL)?;
 
+        // Command-line management of file associations, for scripts/installers.
+        let arg = std::env::args_os().nth(1);
+        match arg.as_ref().and_then(|a| a.to_str()) {
+            Some("--register") => return assoc::register(),
+            Some("--unregister") => {
+                assoc::unregister();
+                return Ok(());
+            }
+            Some("--set-default") => {
+                assoc::register()?;
+                assoc::open_default_apps_settings(None);
+                return Ok(());
+            }
+            _ => {}
+        }
+
+        // Keep the registration current (e.g. after the exe was moved) so
+        // Forus is always offered in "Open with" and Default apps.
+        std::thread::spawn(|| {
+            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+            if !assoc::is_registered() {
+                let _ = assoc::register();
+            }
+        });
+
         let instance = GetModuleHandleW(None)?;
         let class_name = w!("ForusViewerWindow");
         let wc = WNDCLASSEXW {
@@ -72,7 +98,8 @@ pub fn run() -> Result<()> {
             style: CS_DBLCLKS,
             lpfnWndProc: Some(wndproc),
             hInstance: instance.into(),
-            hIcon: LoadIconW(None, IDI_APPLICATION)?,
+            hIcon: LoadIconW(Some(instance.into()), PCWSTR(1 as _))
+                .or_else(|_| LoadIconW(None, IDI_APPLICATION))?,
             hCursor: LoadCursorW(None, IDC_ARROW)?,
             hbrBackground: HBRUSH(GetStockObject(BLACK_BRUSH).0),
             lpszClassName: class_name,
@@ -117,7 +144,7 @@ pub fn run() -> Result<()> {
         );
 
         let mut app = App::new(hwnd)?;
-        if let Some(arg) = std::env::args_os().nth(1) {
+        if let Some(arg) = arg {
             app.open(PathBuf::from(arg));
         }
         APP.with(|cell| *cell.borrow_mut() = Some(app));
@@ -232,6 +259,8 @@ struct Picture {
     size: (u32, u32),
     orientation: u16,
     has_alpha: bool,
+    /// Vector art: may be enlarged to fit the window.
+    scalable: bool,
 }
 
 impl Picture {
@@ -540,6 +569,7 @@ impl App {
                 size: img.source_size,
                 orientation: img.orientation,
                 has_alpha: img.has_alpha,
+                scalable: img.scalable,
             }),
             Err(e) => Content::Error(format!("Couldn't upload image to the GPU: {}", e.message())),
         };
@@ -557,10 +587,12 @@ impl App {
     fn open_dialog(&mut self) {
         let result: Result<PathBuf> = (|| unsafe {
             let dialog: IFileOpenDialog = CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER)?;
-            let all: Vec<&str> = files::IMAGE_EXTENSIONS.iter().chain(files::VIDEO_EXTENSIONS).copied().collect();
+            let images = files::image_extensions();
+            let all: Vec<&str> =
+                images.iter().map(String::as_str).chain(files::VIDEO_EXTENSIONS.iter().copied()).collect();
             let specs = [
                 (HSTRING::from("Photos and videos"), HSTRING::from(files::filter_spec(&all))),
-                (HSTRING::from("Photos"), HSTRING::from(files::filter_spec(files::IMAGE_EXTENSIONS))),
+                (HSTRING::from("Photos"), HSTRING::from(files::filter_spec(images))),
                 (HSTRING::from("Videos"), HSTRING::from(files::filter_spec(files::VIDEO_EXTENSIONS))),
                 (HSTRING::from("All files"), HSTRING::from("*.*")),
             ];
@@ -582,6 +614,18 @@ impl App {
         }
     }
 
+    /// Registers Forus and opens its page in Settings → Default apps, where
+    /// "Set default" makes it the default for all its types.
+    fn make_default(&mut self) {
+        match assoc::register() {
+            Ok(()) => {
+                assoc::open_default_apps_settings(Some(self.hwnd));
+                self.toast("In Settings, click \"Set default\" for Forus");
+            }
+            Err(e) => self.toast(&format!("Couldn't register file types: {}", e.message())),
+        }
+    }
+
     fn reveal_in_explorer(&self) {
         let Some(path) = self.current_path() else { return };
         let args = HSTRING::from(format!("/select,\"{}\"", path.display()));
@@ -595,7 +639,7 @@ impl App {
     /// (logical width, height, orientation quarters, mirrored, may upscale)
     fn content_geometry(&self) -> Option<(f32, f32, u8, bool, bool)> {
         let (w, h, (q, flip), upscale) = match &self.content {
-            Content::Image(p) => (p.size.0, p.size.1, exif_transform(p.orientation), false),
+            Content::Image(p) => (p.size.0, p.size.1, exif_transform(p.orientation), p.scalable),
             Content::Video(v) => {
                 let (_, size) = v.bitmap()?;
                 (size.0, size.1, (0, false), true)
@@ -903,6 +947,7 @@ impl App {
                 let lines = [
                     ("Open a photo or video", &self.fonts.title, 0.95),
                     ("Drop a file here, or press Ctrl+O  ·  F1 for shortcuts", &self.fonts.body, 0.6),
+                    ("Press D to make Forus your default photo and video viewer", &self.fonts.body, 0.45),
                 ];
                 let mut y = h / 2.0 - 24.0 * s;
                 for (text, font, a) in lines {
@@ -1069,6 +1114,7 @@ impl App {
             ("M / L", "Mute / loop"),
             ("I", "Keep info visible"),
             ("E", "Show in File Explorer"),
+            ("D", "Make Forus your default viewer"),
             ("Esc", "Exit full screen / quit"),
         ];
         let g = &self.gfx;
@@ -1231,6 +1277,7 @@ impl App {
                 self.toast(if self.pin_info { "Info stays visible" } else { "Info auto-hides" });
             }
             VK_E => self.reveal_in_explorer(),
+            VK_D => self.make_default(),
             VK_F1 | VK_H | VK_OEM_2 => self.show_help = true,
             VK_F11 | VK_RETURN => self.toggle_fullscreen(),
             VK_ESCAPE => {

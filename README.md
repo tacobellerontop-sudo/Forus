@@ -24,8 +24,14 @@ top of native Windows APIs: no runtime, no Electron, a single ~450 KB `.exe`.
 
 | Photos | Videos |
 | --- | --- |
-| JPEG, PNG, animated GIF, BMP, TIFF, ICO, WebP, JPEG XR, DDS | MP4, MOV, M4V, MKV, AVI, WMV, WebM, MPEG-TS, 3GP |
-| HEIC/HEIF, AVIF, JPEG XL, camera RAW: need the matching codec from the Microsoft Store | HEVC, VP9 and AV1 need their video extension from the Microsoft Store |
+| JPEG, PNG, animated GIF, BMP, TIFF, ICO/CUR, WebP, JPEG XR, DDS (Windows codecs) | MP4, MOV, M4V, MKV, AVI, WMV, WebM, MPEG-TS, 3GP |
+| SVG/SVGZ, Photoshop PSD/PSB, JPEG XL, OpenEXR, Radiance HDR, TGA, QOI, PBM/PGM/PPM/PAM, farbfeld (built-in decoders) | |
+| HEIC/HEIF, AVIF, camera RAW: need the matching codec from the Microsoft Store | HEVC, VP9 and AV1 need their video extension from the Microsoft Store |
+
+Forus also picks up any other image codec installed on the PC (Windows asks
+each installed codec which extensions it handles), so third-party codecs work
+automatically. If Windows can't decode a file, the built-in decoders get a
+second try, and a damaged file shows an error instead of crashing the viewer.
 
 Animated GIFs play with their own frame timing, offsets and disposal modes,
 matching how browsers show them. EXIF orientation is applied automatically. Transparent images are drawn over a
@@ -34,9 +40,23 @@ checkerboard.
 ## Using it
 
 Open a file with **Ctrl+O**, drag it onto the window, or pass it on the command
-line (`forus.exe photo.jpg`). To make it the default viewer, use *Open with →
-Choose another app* in File Explorer. Forus then browses every photo and video
-in that folder.
+line (`forus.exe photo.jpg`). Forus then browses every photo and video in that
+folder.
+
+### Making Forus your default viewer
+
+Forus registers itself for every format above when it first runs (per user, no
+admin rights needed), so it appears in File Explorer's *Open with* menu. To
+make it the default, press **D** in Forus, or run `forus.exe --set-default`.
+Settings opens on Forus's page under *Default apps*; click **Set default**.
+Windows doesn't allow apps to make themselves the default, so this click has
+to be yours.
+
+| Command | Effect |
+| --- | --- |
+| `forus.exe --set-default` | Register and open Forus's Default apps page |
+| `forus.exe --register` | Register file types silently (for scripts) |
+| `forus.exe --unregister` | Remove all of Forus's file-type registrations |
 
 | Keys | Action |
 | --- | --- |
@@ -55,6 +75,7 @@ in that folder.
 | M / L | Mute / toggle looping |
 | I | Keep the info bar visible |
 | E | Show the file in File Explorer |
+| D | Make Forus your default viewer |
 | F1 or H | Show all shortcuts |
 | Esc | Leave full screen, or quit |
 
@@ -87,6 +108,10 @@ cargo build --release --target x86_64-pc-windows-gnu
 | --- | --- |
 | `src/app.rs` | Window, message loop, input, view math and UI drawing |
 | `src/gfx.rs` | D3D11 device, swap chain, Direct2D/DirectWrite helpers |
-| `src/decode.rs` | Background WIC decoding with EXIF orientation |
+| `src/decode.rs` | Background WIC decoding with EXIF orientation and GIF animation |
+| `src/fallback.rs` | Built-in decoders: SVG (resvg), JPEG XL, EXR/HDR, TGA, QOI, PNM... |
+| `src/psd.rs` | Reads the flattened composite image from PSD/PSB files |
+| `src/assoc.rs` | File-type registration for *Open with* and *Default apps* |
 | `src/video.rs` | Media Engine playback into a shared D3D11 texture |
-| `src/files.rs` | Supported formats and Explorer-order folder listing |
+| `src/files.rs` | Supported formats (incl. installed codecs) and Explorer-order folder listing |
+| `assets/` | App icon (SVG sources and `.ico`) and Windows manifest |

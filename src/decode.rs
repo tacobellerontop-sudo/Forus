@@ -1,4 +1,4 @@
-//! Background image decoding with WIC.
+//! Background image decoding: WIC first, bundled decoders as a fallback.
 //!
 //! Decoding a large JPEG/HEIC can take hundreds of milliseconds, so it runs on
 //! a worker thread. The worker produces premultiplied BGRA pixels that the UI
@@ -20,11 +20,11 @@ use windows::Win32::System::Com::{
 };
 use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 
-use crate::WM_APP_DECODED;
+use crate::{fallback, WM_APP_DECODED};
 
 /// Upper bound on decoded pixels; larger images are downscaled while decoding
 /// to keep memory reasonable (still far beyond any screen).
-const MAX_PIXELS: u64 = 120_000_000;
+pub const MAX_PIXELS: u64 = 120_000_000;
 
 /// Memory budget for all composited frames of an animation.
 const MAX_ANIMATION_BYTES: usize = 768 * 1024 * 1024;
@@ -52,6 +52,8 @@ pub struct DecodedImage {
     pub animation: Vec<AnimationFrame>,
     /// Display time of the first frame.
     pub first_delay: Duration,
+    /// Vector art (SVG): fit-to-window may enlarge it.
+    pub scalable: bool,
 }
 
 pub struct Decoded {
@@ -122,10 +124,7 @@ fn worker(queue: Arc<Queue>, tx: Sender<Decoded>, hwnd: isize, max_dimension: u3
                 jobs = queue.ready.wait(jobs).unwrap();
             }
         };
-        let result = match &factory {
-            Some(f) => decode(f, &path, max_dimension).map(Arc::new).map_err(describe),
-            None => Err("Windows Imaging Component is unavailable".into()),
-        };
+        let result = decode_any(factory.as_ref(), &path, max_dimension).map(Arc::new);
         if tx.send(Decoded { path, result }).is_err() {
             return;
         }
@@ -133,6 +132,34 @@ fn worker(queue: Arc<Queue>, tx: Sender<Decoded>, hwnd: isize, max_dimension: u3
             let _ = PostMessageW(Some(HWND(hwnd as _)), WM_APP_DECODED, WPARAM(0), LPARAM(0));
         }
     }
+}
+
+/// Tries Windows' codecs first (they're fast and hardware-tuned), then our
+/// bundled decoders. Formats we handle better ourselves go straight there.
+fn decode_any(
+    factory: Option<&IWICImagingFactory>,
+    path: &Path,
+    max_dimension: u32,
+) -> Result<DecodedImage, String> {
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+    if fallback::preferred(&ext) {
+        return fallback_guarded(path, &ext, max_dimension);
+    }
+    let wic_error = match factory.map(|f| decode(f, path, max_dimension)) {
+        Some(Ok(img)) => return Ok(img),
+        Some(Err(e)) => describe(e),
+        None => "Windows Imaging Component is unavailable".to_string(),
+    };
+    // Prefer the WIC message (e.g. "install the HEIC extension") when our
+    // decoders don't know the format either.
+    fallback_guarded(path, &ext, max_dimension).map_err(|_| wic_error)
+}
+
+/// Runs a bundled decoder, turning a panic on a malformed file into an error
+/// instead of taking the viewer down.
+fn fallback_guarded(path: &Path, ext: &str, max_dimension: u32) -> Result<DecodedImage, String> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| fallback::decode(path, ext, max_dimension)))
+        .unwrap_or_else(|_| Err("This file is damaged or uses an unsupported variant of its format.".into()))
 }
 
 fn describe(e: windows::core::Error) -> String {
@@ -171,7 +198,7 @@ fn decode(
             // Fall through and show the first frame on its own.
         }
 
-        let frame = decoder.GetFrame(0)?;
+        let frame = decoder.GetFrame(largest_frame(&decoder, frame_count))?;
         let orientation = read_orientation(&frame).unwrap_or(1);
 
         let (mut w, mut h) = (0u32, 0u32);
@@ -223,6 +250,7 @@ fn decode(
             has_alpha,
             animation: Vec::new(),
             first_delay: Duration::ZERO,
+            scalable: false,
         })
     }
 }
@@ -339,8 +367,28 @@ fn decode_gif(
             has_alpha,
             animation: frames.collect(),
             first_delay: first.delay,
+            scalable: false,
         })
     }
+}
+
+/// Icons store several sizes; show the biggest. Other formats use frame 0.
+fn largest_frame(decoder: &IWICBitmapDecoder, frame_count: u32) -> u32 {
+    let is_icon = unsafe { decoder.GetContainerFormat() }.is_ok_and(|f| f == GUID_ContainerFormatIco);
+    if !is_icon {
+        return 0;
+    }
+    (0..frame_count)
+        .max_by_key(|&i| {
+            let (mut w, mut h) = (0u32, 0u32);
+            unsafe {
+                if let Ok(f) = decoder.GetFrame(i) {
+                    let _ = f.GetSize(&mut w, &mut h);
+                }
+            }
+            w as u64 * h as u64
+        })
+        .unwrap_or(0)
 }
 
 fn read_orientation(frame: &IWICBitmapFrameDecode) -> Option<u16> {
