@@ -19,7 +19,8 @@ const KNOWN_IMAGE_EXTENSIONS: &[&str] = &[
     "tiff", "ico", "cur", "jxr", "wdp", "hdp", "dds", "webp",
     // Fallback decoders bundled with Forus
     "svg", "svgz", "psd", "psb", "tga", "icb", "vda", "vst", "qoi", "pbm", "pgm", "ppm", "pnm", "pam",
-    "hdr", "pic", "exr", "ff", "jxl", "pcx", "icns", "kra", "ora", "procreate", "sketch",
+    "hdr", "pic", "exr", "ff", "jxl", "pcx", "icns", "kra", "ora", "procreate", "sketch", "emf", "emz",
+    "wmf", "wmz",
     // Need a codec extension from the Microsoft Store
     "heic", "heif", "hif", "avif", "avifs",
 ];
@@ -80,7 +81,8 @@ fn installed_wic_extensions() -> Vec<String> {
 
 /// Containers played through the Media Foundation Media Engine.
 pub const VIDEO_EXTENSIONS: &[&str] = &[
-    "mp4", "m4v", "mov", "mkv", "webm", "avi", "wmv", "asf", "3gp", "3g2", "ts", "m2ts", "mts",
+    "mp4", "m4v", "mov", "mkv", "webm", "avi", "wmv", "asf", "3gp", "3g2", "ts", "m2ts", "mts", "mpg",
+    "mpeg",
 ];
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
