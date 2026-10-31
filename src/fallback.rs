@@ -16,7 +16,8 @@ use crate::decode::DecodedImage;
 /// Formats we decode ourselves even when a WIC codec claims them, because
 /// our decoder is more complete.
 pub fn preferred(ext: &str) -> bool {
-    matches!(ext, "svg" | "svgz" | "psd" | "psb" | "pcx" | "icns" | "kra" | "ora" | "procreate" | "sketch")
+    matches!(ext, "svg" | "svgz" | "psd" | "psb" | "pcx" | "icns" | "kra" | "ora" | "procreate" | "sketch" | "emf" | "emz" | "wmf" | "wmz"
+    )
 }
 
 /// Camera RAW formats: WIC decodes them fully when Microsoft's Raw Image
@@ -32,6 +33,7 @@ pub fn decode(path: &Path, ext: &str, max_dimension: u32) -> Result<DecodedImage
         "psd" | "psb" => decode_psd(path, max_dimension),
         "jxl" => decode_jxl(path, max_dimension),
         "pcx" => crate::extra::pcx(path, max_dimension),
+        "emf" | "emz" | "wmf" | "wmz" => crate::metafile::decode(path, max_dimension),
         "icns" => crate::extra::icns(path, max_dimension),
         "kra" | "ora" | "procreate" | "sketch" => crate::extra::zip_preview(path, ext, max_dimension),
         _ if RAW_EXTENSIONS.contains(&ext) => crate::extra::raw_preview(path, max_dimension),
@@ -204,7 +206,7 @@ pub fn from_rgba(mut rgba: RgbaImage, max_dimension: u32) -> DecodedImage {
 }
 
 /// Builds the result from premultiplied BGRA pixels.
-fn finish(width: u32, height: u32, pixels: Vec<u8>, source_size: (u32, u32)) -> DecodedImage {
+pub(crate) fn finish(width: u32, height: u32, pixels: Vec<u8>, source_size: (u32, u32)) -> DecodedImage {
     let has_alpha = pixels.as_chunks::<4>().0.iter().any(|p| p[3] != 255);
     DecodedImage {
         width,

@@ -38,6 +38,8 @@ const BACKGROUND: D2D1_COLOR_F = D2D1_COLOR_F { r: 0.075, g: 0.075, b: 0.078, a:
 const ACCENT: D2D1_COLOR_F = D2D1_COLOR_F { r: 0.30, g: 0.64, b: 1.0, a: 1.0 };
 const MIN_ZOOM: f32 = 0.01;
 const MAX_ZOOM: f32 = 64.0;
+/// How long a zoom (wheel, keys, fit, actual size) takes to glide into place.
+const ZOOM_ANIM: Duration = Duration::from_millis(180);
 const UI_HIDE_AFTER: f32 = 2.0;
 const UI_FADE: f32 = 0.3;
 const TIMER_SIZEMOVE: usize = 1;
@@ -346,6 +348,17 @@ struct View {
     pan: (f32, f32),
     /// Extra clockwise quarter turns chosen by the user.
     rotation: u8,
+    /// A zoom in progress, gliding from this placement to the one above.
+    anim: Option<ZoomAnim>,
+}
+
+#[derive(Clone, Copy)]
+struct ZoomAnim {
+    /// Scale and center that were on screen when the zoom started.
+    scale: f32,
+    cx: f32,
+    cy: f32,
+    start: Instant,
 }
 
 struct Drag {
@@ -827,7 +840,43 @@ impl App {
         (w / 2.0, self.top() + h / 2.0)
     }
 
+    /// Where the content is drawn right now: the target placement, or a point
+    /// on the way to it while a zoom animates.
     fn placement(&self) -> Option<Placement> {
+        let mut p = self.target_placement()?;
+        let Some(a) = self.view.anim else { return Some(p) };
+        let t = a.start.elapsed().as_secs_f32() / ZOOM_ANIM.as_secs_f32();
+        if t >= 1.0 {
+            return Some(p);
+        }
+        let e = 1.0 - (1.0 - t).powi(3); // ease-out cubic
+        let k = p.scale / a.scale;
+        let r = k.powf(e); // scale changes geometrically, so speed feels even
+        if (k - 1.0).abs() < 1e-3 {
+            p.cx = a.cx + (p.cx - a.cx) * e;
+            p.cy = a.cy + (p.cy - a.cy) * e;
+        } else {
+            // Zoom about the one point both placements agree on, so whatever
+            // is under the cursor stays under it the whole way.
+            let fx = (p.cx - a.cx * k) / (1.0 - k);
+            let fy = (p.cy - a.cy * k) / (1.0 - k);
+            p.cx = fx + (a.cx - fx) * r;
+            p.cy = fy + (a.cy - fy) * r;
+        }
+        p.scale = a.scale * r;
+        Some(p)
+    }
+
+    /// Starts gliding from `from` (what was on screen) to the current view.
+    fn animate_view_from(&mut self, from: Option<Placement>) {
+        self.view.anim = from.map(|p| ZoomAnim { scale: p.scale, cx: p.cx, cy: p.cy, start: Instant::now() });
+        // A little extra so the final, settled frame is drawn too.
+        self.animate_for(ZOOM_ANIM + Duration::from_millis(50));
+        self.dirty = true;
+    }
+
+    /// Where the content settles once any zoom animation finishes.
+    fn target_placement(&self) -> Option<Placement> {
         let (w, h, q, _, upscale) = self.content_geometry()?;
         let (dw, dh) = if q % 2 == 1 { (h, w) } else { (w, h) };
         let (ww, wh) = self.window_size();
@@ -860,7 +909,8 @@ impl App {
     }
 
     fn zoom_at(&mut self, factor: f32, x: f32, y: f32) {
-        let Some(p) = self.placement() else { return };
+        let shown = self.placement();
+        let Some(p) = self.target_placement() else { return };
         let mut new = (p.scale * factor).clamp(MIN_ZOOM, MAX_ZOOM);
         // Snap back to "fit" when zooming out past it.
         if factor < 1.0 && new <= p.fit && p.scale > p.fit {
@@ -872,8 +922,8 @@ impl App {
         let pan = (ox - (ox - (p.cx - vx)) * f, oy - (oy - (p.cy - vy)) * f);
         self.view.zoom = if (new - p.fit).abs() < 1e-4 { None } else { Some(new) };
         self.view.pan = self.clamp_pan(pan, new, p.dw, p.dh);
+        self.animate_view_from(shown);
         self.toast(&format!("{:.0}%", new * 100.0));
-        self.dirty = true;
     }
 
     fn zoom_center(&mut self, factor: f32) {
@@ -882,19 +932,21 @@ impl App {
     }
 
     fn set_actual_size(&mut self) {
-        if let Some(p) = self.placement() {
+        let shown = self.placement();
+        if let Some(p) = self.target_placement() {
             self.view.zoom = if (p.fit - 1.0).abs() < 1e-4 { None } else { Some(1.0) };
             self.view.pan = (0.0, 0.0);
+            self.animate_view_from(shown);
             self.toast("100%");
-            self.dirty = true;
         }
     }
 
     fn fit(&mut self) {
+        let shown = self.placement();
         self.view.zoom = None;
         self.view.pan = (0.0, 0.0);
+        self.animate_view_from(shown);
         self.toast("Fit to window");
-        self.dirty = true;
     }
 
     fn rotate(&mut self, clockwise: bool) {
@@ -904,6 +956,7 @@ impl App {
         self.view.rotation = (self.view.rotation + if clockwise { 1 } else { 3 }) % 4;
         self.view.zoom = None;
         self.view.pan = (0.0, 0.0);
+        self.view.anim = None;
         self.dirty = true;
     }
 
@@ -1665,7 +1718,7 @@ impl App {
                 } else if let Some(d) = &self.drag {
                     if self.view.zoom.is_some() {
                         self.view.pan = (d.pan.0 + x - d.start.0, d.pan.1 + y - d.start.1);
-                        if let Some(p) = self.placement() {
+                        if let Some(p) = self.target_placement() {
                             self.view.pan = self.clamp_pan(self.view.pan, p.scale, p.dw, p.dh);
                         }
                         self.dirty = true;
@@ -1784,7 +1837,7 @@ impl App {
 
     /// The pan actually in effect (after clamping).
     fn placement_pan(&self) -> (f32, f32) {
-        match self.placement() {
+        match self.target_placement() {
             Some(p) => {
                 let (vx, vy) = self.view_center();
                 (p.cx - vx, p.cy - vy)

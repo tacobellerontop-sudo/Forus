@@ -18,6 +18,8 @@ You can also just run `forus.exe` directly, without installing.
 - **Direct3D 11 + Direct2D:** every frame is drawn on the GPU into a
   flip-model DXGI swap chain with vsync. Zooming, panning and rotating are
   transforms applied when the bitmap is drawn, so they're instant at any size.
+  Zoom steps glide into place over a short eased animation, anchored on the
+  point under the cursor.
 - **Photos:** decoded on a background thread, uploaded once to a GPU bitmap.
   Neighbouring files are prefetched, so stepping through a folder is immediate.
   Filtering is high-quality cubic when downscaling and switches to
@@ -35,9 +37,9 @@ You can also just run `forus.exe` directly, without installing.
 
 | Photos | Videos |
 | --- | --- |
-| JPEG, PNG, GIF, BMP, TIFF, ICO/CUR, WebP, JPEG XR, DDS (Windows codecs) | MP4, MOV, M4V, MKV, AVI, WMV, WebM, MPEG-TS, 3GP |
+| JPEG, PNG, GIF, BMP, TIFF, ICO/CUR, WebP, JPEG XR, DDS (Windows codecs) | MP4, MOV, M4V, MKV, AVI, WMV, WebM, MPEG-TS, MPEG-PS (.mpg), 3GP |
 | Animated GIF, WebP and PNG (APNG) | |
-| SVG/SVGZ, Photoshop PSD/PSB, JPEG XL, OpenEXR, Radiance HDR, TGA, QOI, PCX, PBM/PGM/PPM/PAM, farbfeld, macOS ICNS | |
+| SVG/SVGZ, Photoshop PSD/PSB, JPEG XL, OpenEXR, Radiance HDR, TGA, QOI, PCX, PBM/PGM/PPM/PAM, farbfeld, macOS ICNS, Windows metafiles (EMF/WMF, EMZ/WMZ) | |
 | Krita (.kra), OpenRaster (.ora), Procreate and Sketch documents (their flattened preview) | |
 | Camera RAW (CR2, CR3, NEF, ARW, RAF, ORF, RW2, DNG, PEF and more) | |
 | HEIC/HEIF, AVIF: need the matching codec from the Microsoft Store | HEVC, VP9 and AV1 need their video extension from the Microsoft Store |
@@ -138,6 +140,7 @@ makensis -DVERSION=0.1.0 -DEXE=../target/x86_64-pc-windows-gnu/release/forus.exe
 | `src/decode.rs` | Background decoding: WIC first, with EXIF orientation and GIF animation |
 | `src/fallback.rs` | Built-in decoders: SVG (resvg), JPEG XL, EXR/HDR, TGA, QOI, PNM... |
 | `src/extra.rs` | Animated WebP/APNG, camera RAW previews, PCX, ICNS, Krita/OpenRaster/Procreate/Sketch |
+| `src/metafile.rs` | Windows metafiles (EMF/WMF), played by GDI into a bitmap |
 | `src/psd.rs` | Reads the flattened composite image from PSD/PSB files |
 | `src/assoc.rs` | File-type registration for *Open with* and *Default apps* |
 | `src/video.rs` | Media Engine playback into a shared D3D11 texture |

@@ -12,6 +12,7 @@ mod extra;
 mod fallback;
 mod files;
 mod gfx;
+mod metafile;
 mod psd;
 mod titlebar;
 mod video;
